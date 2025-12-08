@@ -81,6 +81,38 @@ function matchesDomainPattern(hostname: string, pattern: string): boolean {
   return hostname.toLowerCase() === pattern.toLowerCase()
 }
 
+/**
+ * Check if an IPv4 address is in a private/reserved range
+ * Covers: localhost, private networks, link-local (including cloud metadata)
+ */
+function isPrivateIPv4(ip: string): boolean {
+  const parts = ip.split('.').map(Number)
+
+  // Validate IPv4 format
+  if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) {
+    return false
+  }
+
+  const [a, b] = parts
+
+  // 127.0.0.0/8 - Loopback/localhost
+  if (a === 127) return true
+
+  // 10.0.0.0/8 - Private network
+  if (a === 10) return true
+
+  // 172.16.0.0/12 - Private network (172.16.0.0 - 172.31.255.255)
+  if (a === 172 && b >= 16 && b <= 31) return true
+
+  // 192.168.0.0/16 - Private network
+  if (a === 192 && b === 168) return true
+
+  // 169.254.0.0/16 - Link-local (includes cloud metadata endpoints)
+  if (a === 169 && b === 254) return true
+
+  return false
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -91,7 +123,7 @@ async function filterNetworkRequest(
     return false
   }
 
-  // Check denied domains first
+  // Check denied domains first (always applies, even with allowAll)
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(host, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
@@ -99,7 +131,25 @@ async function filterNetworkRequest(
     }
   }
 
-  // Check allowed domains
+  // Check if private IPs should be blocked (applies even with allowAll)
+  if (config.network.blockPrivateIPs) {
+    // Import net module to check if host is an IP
+    const net = await import('net')
+    if (net.isIPv4(host)) {
+      if (isPrivateIPv4(host)) {
+        logForDebugging(`Blocked private IPv4 address: ${host}:${port}`)
+        return false
+      }
+    }
+  }
+
+  // If allowAll is true, permit all non-denied connections
+  if (config.network.allowAll) {
+    logForDebugging(`Allowed by allowAll policy: ${host}:${port}`)
+    return true
+  }
+
+  // Check allowed domains (only when allowAll is false or undefined)
   for (const allowedDomain of config.network.allowedDomains) {
     if (matchesDomainPattern(host, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
@@ -508,10 +558,13 @@ async function wrapWithSandbox(
   // Network restriction is needed when:
   // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
   // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+  // 3. OR customConfig/config has allowAll defined (allow all with deny list)
   // An empty allowedDomains array means "no domains allowed" = block all network access
   const hasNetworkConfig =
     customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    config?.network?.allowedDomains !== undefined ||
+    customConfig?.network?.allowAll !== undefined ||
+    config?.network?.allowAll !== undefined
 
   // Get the actual allowed domains list for proxy filtering
   const allowedDomains =
@@ -519,13 +572,18 @@ async function wrapWithSandbox(
     config?.network.allowedDomains ??
     []
 
+  // Get the allowAll flag
+  const allowAll =
+    customConfig?.network?.allowAll ?? config?.network?.allowAll ?? false
+
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
   const needsNetworkRestriction = hasNetworkConfig
 
-  // Network PROXY is only needed when there are domains to filter
-  // If allowedDomains is empty, we block all network and don't need the proxy
-  const needsNetworkProxy = allowedDomains.length > 0
+  // Network PROXY is needed when:
+  // 1. There are domains to filter (allowedDomains.length > 0), OR
+  // 2. allowAll is true (proxy needed to allow traffic and enforce deny list)
+  const needsNetworkProxy = allowedDomains.length > 0 || allowAll
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {

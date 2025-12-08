@@ -279,12 +279,28 @@ srt --settings /path/to/srt-settings.json <command>
 
 #### Network Configuration
 
-Uses an **allow-only pattern** - all network access is denied by default.
+Uses an **allow-only pattern** by default - all network access is denied unless explicitly allowed.
 
-- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
-- `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
+- `network.allowAll` - Allow ALL network connections except those explicitly denied (boolean, default: false). When true, `allowedDomains` is ignored. **WARNING**: This significantly reduces security - use with caution.
+- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access. Ignored when `allowAll` is true.
+- `network.deniedDomains` - Array of denied domains (checked first, takes precedence over `allowedDomains` and `allowAll`)
+- `network.blockPrivateIPs` - Block connections to private IP ranges: localhost (127.0.0.0/8), private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), and link-local including cloud metadata endpoints (169.254.0.0/16). **Recommended when using `allowAll`** (boolean, default: false)
 - `network.allowUnixSockets` - Array of Unix socket paths that can be accessed (macOS only)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
+
+> **⚠️ SECURITY WARNING - IP Bypass Vulnerability**
+>
+> When using `allowAll: true`, domain-based deny rules (`deniedDomains`) can be **easily bypassed using direct IP addresses**.
+>
+> **Why this happens:** Domain filtering only checks DNS names, not resolved IP addresses. An attacker (or AI agent) can bypass domain rules by using IPs directly, or by using DNS servers you don't control.
+>
+> **Mitigation - Use `blockPrivateIPs`:** When `blockPrivateIPs: true`, connections to localhost, internal networks, and cloud metadata services (169.254.169.254) are blocked, protecting against the most critical attacks (credential theft, internal network access). However, public IP addresses remain unrestricted.
+>
+> **Recommendation:**
+> - **Always enable `blockPrivateIPs: true`** when using `allowAll` if running on cloud infrastructure (AWS/GCP/Azure) or with internal services.
+> - If you need to block specific public destinations, domain filtering alone is insufficient - you would need full IP/CIDR-based filtering (see GitHub issues for roadmap).
+>
+> **Use case:** This feature is designed for AI agents that need general web access while maintaining **strict filesystem security**. The primary security boundary is the filesystem, not the network.
 
 #### Filesystem Configuration
 
@@ -333,6 +349,27 @@ Examples:
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
 
 ### Common Configuration Recipes
+
+**Allow all network access with deny list** (for AI agents that need web access):
+
+```json
+{
+  "network": {
+    "allowAll": true,
+    "blockPrivateIPs": true,
+    "deniedDomains": [
+      "internal.company.com",
+      "*.internal.corp"
+    ],
+    "allowedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["~/.ssh", "~/.aws"],
+    "allowWrite": ["."],
+    "denyWrite": [".env", ".git/hooks"]
+  }
+}
+```
 
 **Allow GitHub access** (all necessary endpoints):
 

@@ -59,12 +59,27 @@ const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
+  allowAll: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow ALL network connections except those explicitly denied. ' +
+        'When true, allowedDomains is ignored and all connections are permitted unless in deniedDomains. ' +
+        'WARNING: This significantly reduces security - use with caution and maintain a deny list.',
+    ),
   allowedDomains: z
     .array(domainPatternSchema)
     .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
   deniedDomains: z
     .array(domainPatternSchema)
     .describe('List of denied domains'),
+  blockPrivateIPs: z
+    .boolean()
+    .optional()
+    .describe(
+      'Block connections to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16). ' +
+        'Recommended when using allowAll to prevent access to localhost services, internal networks, and cloud metadata endpoints (default: false).',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()
