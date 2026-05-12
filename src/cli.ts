@@ -141,18 +141,23 @@ async function main(): Promise<void> {
             stdio: 'inherit',
           })
 
+          const cleanupAndExit = (code: number): never => {
+            SandboxManager.cleanupAfterCommand()
+            process.exit(code)
+          }
+
           // Handle process exit
           child.on('exit', (code, signal) => {
             if (signal) {
               console.error(`Process killed by signal: ${signal}`)
-              process.exit(1)
+              cleanupAndExit(1)
             }
-            process.exit(code ?? 0)
+            cleanupAndExit(code ?? 0)
           })
 
           child.on('error', error => {
             console.error(`Failed to execute command: ${error.message}`)
-            process.exit(1)
+            cleanupAndExit(1)
           })
 
           // Handle cleanup on interrupt

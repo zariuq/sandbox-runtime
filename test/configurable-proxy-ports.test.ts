@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { describe, it, expect, afterAll } from 'bun:test'
 import * as http from 'node:http'
 import * as net from 'node:net'
 import { SandboxManager } from '../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
 import { getPlatform } from '../src/utils/platform.js'
+import { runCommandAsync } from './helpers/run-command-async.js'
 
 /**
  * Integration tests for configurable proxy ports feature
@@ -310,18 +310,22 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           const { port, hostname } = new URL(`http://${req.url}`)
 
           // Connect to target (allow everything - no filtering)
-          const serverSocket = net.connect(parseInt(port) || 80, hostname, () => {
-            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-            serverSocket.write(head)
-            serverSocket.pipe(clientSocket)
-            clientSocket.pipe(serverSocket)
-          })
+          const serverSocket = net.connect(
+            parseInt(port) || 80,
+            hostname,
+            () => {
+              clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+              serverSocket.write(head)
+              serverSocket.pipe(clientSocket)
+              clientSocket.pipe(serverSocket)
+            },
+          )
 
-          serverSocket.on('error', (err) => {
+          serverSocket.on('error', () => {
             clientSocket.end()
           })
 
-          clientSocket.on('error', (err) => {
+          clientSocket.on('error', () => {
             serverSocket.end()
           })
         })
@@ -337,12 +341,12 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             headers: req.headers,
           }
 
-          const proxyReq = http.request(options, (proxyRes) => {
+          const proxyReq = http.request(options, proxyRes => {
             res.writeHead(proxyRes.statusCode!, proxyRes.headers)
             proxyRes.pipe(res)
           })
 
-          proxyReq.on('error', (err) => {
+          proxyReq.on('error', () => {
             res.writeHead(502)
             res.end('Bad Gateway')
           })
@@ -356,7 +360,9 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             const addr = externalProxyServer!.address()
             if (addr && typeof addr === 'object') {
               externalProxyPort = addr.port
-              console.log(`External allow-all proxy started on port ${externalProxyPort}`)
+              console.log(
+                `External allow-all proxy started on port ${externalProxyPort}`,
+              )
               resolve()
             } else {
               reject(new Error('Failed to get proxy address'))
@@ -387,13 +393,11 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         // Try to access example.com (in allowlist)
         // This verifies that requests are routed through the external proxy
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 5 http://example.com'
+          'curl -s --max-time 5 http://example.com',
         )
 
-        const result = spawnSync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
+        const result = await runCommandAsync(command, {
+          timeoutMs: 10000,
         })
 
         // The request should succeed
@@ -404,14 +408,15 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         expect(output).not.toContain('blocked by network allowlist')
 
         console.log('✓ Request to example.com succeeded through external proxy')
-        console.log('✓ This verifies SRT used the external proxy on the configured port')
-
+        console.log(
+          '✓ This verifies SRT used the external proxy on the configured port',
+        )
       } finally {
         // Clean up
         await SandboxManager.reset()
 
         if (externalProxyServer) {
-          await new Promise<void>((resolve) => {
+          await new Promise<void>(resolve => {
             externalProxyServer!.close(() => {
               console.log('External proxy server closed')
               resolve()

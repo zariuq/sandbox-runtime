@@ -17,6 +17,8 @@ import {
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
   hasLinuxSandboxDependenciesSync,
+  cleanupBwrapMountPoints,
+  cleanupTempEmptyFiles,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -385,8 +387,7 @@ function checkDependencies(ripgrepConfig?: {
 
   // Platform-specific dependency checks
   if (platform === 'linux') {
-    const allowAllUnixSockets = config?.network?.allowAllUnixSockets ?? false
-    return hasLinuxSandboxDependenciesSync(allowAllUnixSockets)
+    return hasLinuxSandboxDependenciesSync()
   }
 
   // macOS only needs ripgrep (already checked above)
@@ -395,7 +396,7 @@ function checkDependencies(ripgrepConfig?: {
 
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
-    return { denyOnly: [] }
+    return { denyOnly: [], allowWithinDeny: [], denyWithinAllow: [] }
   }
 
   // Filter out glob patterns on Linux
@@ -409,14 +410,40 @@ function getFsReadConfig(): FsReadRestrictionConfig {
       return true
     })
 
+  const allowPaths = (config.filesystem.allowRead ?? [])
+    .map(path => removeTrailingGlobSuffix(path))
+    .filter(path => {
+      if (getPlatform() === 'linux' && containsGlobChars(path)) {
+        logForDebugging(`Skipping glob pattern on Linux: ${path}`)
+        return false
+      }
+      return true
+    })
+
+  const reDenyPaths = (config.filesystem.denyReadWithinAllow ?? [])
+    .map(path => removeTrailingGlobSuffix(path))
+    .filter(path => {
+      if (getPlatform() === 'linux' && containsGlobChars(path)) {
+        logForDebugging(`Skipping glob pattern on Linux: ${path}`)
+        return false
+      }
+      return true
+    })
+
   return {
     denyOnly: denyPaths,
+    allowWithinDeny: allowPaths,
+    denyWithinAllow: reDenyPaths,
   }
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
   if (!config) {
-    return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
+    return {
+      allowOnly: getDefaultWritePaths(),
+      denyWithinAllow: [],
+      allowWithinDeny: [],
+    }
   }
 
   // Filter out glob patterns on Linux for allowWrite
@@ -441,12 +468,23 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
       return true
     })
 
+  const reAllowPaths = (config.filesystem.allowWriteWithinDeny ?? [])
+    .map(path => removeTrailingGlobSuffix(path))
+    .filter(path => {
+      if (getPlatform() === 'linux' && containsGlobChars(path)) {
+        logForDebugging(`Skipping glob pattern on Linux: ${path}`)
+        return false
+      }
+      return true
+    })
+
   // Build allowOnly list: default paths + configured allow paths
   const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
 
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    allowWithinDeny: reAllowPaths,
   }
 }
 
@@ -548,10 +586,20 @@ async function wrapWithSandbox(
     allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
     denyWithinAllow:
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+    allowWithinDeny:
+      customConfig?.filesystem?.allowWriteWithinDeny ??
+      config?.filesystem.allowWriteWithinDeny ??
+      [],
   }
   const readConfig = {
     denyOnly:
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+    allowWithinDeny:
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+    denyWithinAllow:
+      customConfig?.filesystem?.denyReadWithinAllow ??
+      config?.filesystem.denyReadWithinAllow ??
+      [],
   }
 
   // Check if network config is specified - this determines if we need network restrictions
@@ -633,7 +681,6 @@ async function wrapWithSandbox(
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
@@ -667,7 +714,17 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   logForDebugging('Sandbox configuration updated')
 }
 
+/**
+ * Lightweight cleanup to call after a sandboxed command completes.
+ */
+function cleanupAfterCommand(): void {
+  cleanupBwrapMountPoints()
+  cleanupTempEmptyFiles()
+}
+
 async function reset(): Promise<void> {
+  cleanupAfterCommand()
+
   // Stop log monitor
   if (logMonitorShutdown) {
     logMonitorShutdown()
@@ -934,6 +991,7 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   updateConfig(newConfig: SandboxRuntimeConfig): void
+  cleanupAfterCommand(): void
   reset(): Promise<void>
 }
 
@@ -963,6 +1021,7 @@ export const SandboxManager: ISandboxManager = {
   getLinuxSocksSocketPath,
   waitForNetworkInitialization,
   wrapWithSandbox,
+  cleanupAfterCommand,
   reset,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,

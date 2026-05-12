@@ -4,6 +4,7 @@ import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import {
   normalizePathForSandbox,
+  formatEnvVarsForShellExport,
   generateProxyEnvVars,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
@@ -78,6 +79,7 @@ export type SandboxViolationCallback = (
 ) => void
 
 const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
+let didWarnAllowWriteWithinDenyOnMacOS = false
 
 /**
  * Convert a glob pattern to a regular expression for macOS sandbox profiles
@@ -669,6 +671,16 @@ export function wrapCommandWithSandboxMacOS(
 
   const logTag = generateLogTag(command)
 
+  if (
+    writeConfig?.allowWithinDeny?.length &&
+    !didWarnAllowWriteWithinDenyOnMacOS
+  ) {
+    didWarnAllowWriteWithinDenyOnMacOS = true
+    console.warn(
+      '[sandbox-runtime] filesystem.allowWriteWithinDeny is currently ignored on macOS; write carve-outs within denyWrite are only enforced on Linux.',
+    )
+  }
+
   const profile = generateSandboxProfile({
     readConfig,
     writeConfig,
@@ -684,7 +696,7 @@ export function wrapCommandWithSandboxMacOS(
   })
 
   // Generate proxy environment variables using shared utility
-  const proxyEnv = `export ${generateProxyEnvVars(httpProxyPort, socksProxyPort).join(' ')} && `
+  const proxyEnv = `${formatEnvVarsForShellExport(generateProxyEnvVars(httpProxyPort, socksProxyPort))} && `
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
   // Resolve the full path to the shell binary

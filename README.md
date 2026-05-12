@@ -314,6 +314,7 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.allowWriteWithinDeny` - Re-allow specific subpaths inside a broader `denyWrite` remask (Linux only)
 
 **Path Syntax (macOS):**
 
@@ -330,6 +331,7 @@ Examples:
 - `"allowWrite": ["src/**/*.ts"]` - Allow write to all `.ts` files in `src/` and subdirectories
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
 - `"denyWrite": [".env"]` - Deny write to `.env` file (even if current directory is allowed)
+- `"allowWriteWithinDeny": ["src/generated/"]` - Re-allow a subdirectory inside a broader Linux `denyWrite`
 
 **Path Syntax (Linux):**
 
@@ -441,16 +443,6 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
-**Optional Linux dependencies (for seccomp fallback):**
-
-The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
-
-- `gcc` or `clang` - C compiler
-- `libseccomp-dev` - Seccomp library development files
-  - Ubuntu/Debian: `apt-get install gcc libseccomp-dev`
-  - Fedora: `dnf install gcc libseccomp-devel`
-  - Arch: `pacman -S gcc libseccomp`
-
 **macOS requires:**
 
 - `ripgrep` - Fast search tool for deny path detection
@@ -465,9 +457,6 @@ npm install
 
 # Build the project
 npm run build
-
-# Build seccomp binaries (requires Docker)
-npm run build:seccomp
 
 # Run tests
 npm test
@@ -484,21 +473,6 @@ npm run lint
 # Format code
 npm run format
 ```
-
-### Building Seccomp Binaries
-
-The pre-generated BPF filters are included in the repository, but you can rebuild them if needed:
-
-```bash
-npm run build:seccomp
-```
-
-This script uses Docker to cross-compile seccomp binaries for multiple architectures:
-
-- x64 (x86-64)
-- arm64 (aarch64)
-
-The script builds static generator binaries, generates the BPF filters (~104 bytes each), and stores them in `vendor/seccomp/x64/` and `vendor/seccomp/arm64/`. The generator binaries are removed to keep the package size small.
 
 ## Implementation Details
 
@@ -533,7 +507,8 @@ Filesystem restrictions are enforced at the OS level:
 - **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
   - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
   - Empty `allowWrite: []` = no write access (nothing allowed)
-  - `denyWrite` creates exceptions within allowed paths
+  - `denyWrite` creates read-only islands within allowed paths
+  - `allowWriteWithinDeny` can re-open specific subpaths inside a broader Linux `denyWrite`
 
 This model lets you start with broad read access but maximally restricted write access, then explicitly open the holes you need.
 
@@ -581,30 +556,10 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 - Higher values provide more protection but slower performance
 - Files in CWD (depth 0) are always protected regardless of this setting
 
-### Unix Socket Restrictions (Linux)
+### Unix Socket Behavior
 
-On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Unix domain socket creation at the syscall level. This provides an additional layer of security to prevent processes from creating new Unix domain sockets for local IPC (unless explicitly allowed).
-
-**How it works:**
-
-1. **Pre-generated BPF filters**: The package includes pre-compiled BPF filters for different architectures (x64, ARM64). These are ~104 bytes each and stored in `vendor/seccomp/`. The filters are architecture-specific but libc-independent, so they work with both glibc and musl.
-
-2. **Runtime detection**: The sandbox automatically detects your system's architecture and loads the appropriate pre-generated BPF filter.
-
-3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
-
-4. **Two-stage application using apply-seccomp binary**:
-   - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
-   - apply-seccomp binary applies the seccomp filter via `prctl()`
-   - apply-seccomp execs the user command with seccomp active
-   - User command runs with all sandbox restrictions plus Unix socket creation blocking
-
-**Security limitations**: The filter only blocks `socket(AF_UNIX, ...)` syscalls. It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
-
-**Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
-
-**Architecture support**: x64 and arm64 are fully supported with pre-built binaries. Other architectures are not currently supported. To use sandboxing without Unix socket blocking on unsupported architectures, set `allowAllUnixSockets: true` in your configuration.
+- **Linux**: The runtime now relies on network namespace isolation plus HTTP/SOCKS proxy bridging. It does **not** apply seccomp/BPF Unix-socket filtering anymore. Unix sockets are currently allowed on Linux, and `allowAllUnixSockets` is accepted there only for backward compatibility.
+- **macOS**: Seatbelt rules still control Unix socket access. Use `allowUnixSockets` to allow specific socket paths or `allowAllUnixSockets` to disable Unix socket restrictions entirely.
 
 ### Violation Detection and Monitoring
 

@@ -7,11 +7,15 @@
  * - `undefined` = no restrictions (allow all reads)
  * - `{denyOnly: []}` = no restrictions (empty deny list = allow all reads)
  * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
+ * - `allowWithinDeny` = re-expose subpaths after a broader deny
+ * - `denyWithinAllow` = re-hide specific paths after an allowWithinDeny re-exposure
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
+  allowWithinDeny?: string[]
+  denyWithinAllow?: string[]
 }
 
 /**
@@ -19,9 +23,10 @@ export interface FsReadRestrictionConfig {
  *
  * Semantics:
  * - `undefined` = no restrictions (allow all writes)
- * - `{allowOnly: [], denyWithinAllow: []}` = maximally restrictive (deny ALL writes)
- * - `{allowOnly: [...paths], denyWithinAllow: [...]}` = allow writes only to these paths,
- *   with exceptions for denyWithinAllow
+ * - `{allowOnly: [], denyWithinAllow: [], allowWithinDeny: []}` = maximally restrictive
+ *   (deny ALL writes)
+ * - `{allowOnly: [...paths], denyWithinAllow: [...], allowWithinDeny: [...]}` = allow writes
+ *   only to these paths, re-deny subpaths, then re-expose specific carve-outs
  *
  * This is maximally restrictive by default - only explicitly allowed paths are writable.
  * Note: Empty `allowOnly` means NO paths are writable (unlike read's empty denyOnly).
@@ -29,6 +34,7 @@ export interface FsReadRestrictionConfig {
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
   denyWithinAllow: string[]
+  allowWithinDeny?: string[]
 }
 
 /**

@@ -1,6 +1,6 @@
 import shellquote from 'shell-quote'
 import { logForDebugging } from '../utils/debug.js'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
@@ -18,12 +18,6 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import {
-  generateSeccompFilter,
-  cleanupSeccompFilter,
-  getPreGeneratedBpfPath,
-  getApplySeccompBinaryPath,
-} from './generate-seccomp-filter.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -44,7 +38,6 @@ export interface LinuxSandboxParams {
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   enableWeakerNestedSandbox?: boolean
-  allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
   /** Maximum directory depth to search for dangerous files (default: 3) */
@@ -57,6 +50,50 @@ export interface LinuxSandboxParams {
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+/**
+ * Check if any existing component in the path is a file (not a directory).
+ * If so, the target path can never be created because you can't mkdir under a file.
+ */
+function hasFileAncestor(targetPath: string): boolean {
+  const parts = targetPath.split(path.sep)
+  let currentPath = ''
+
+  for (const part of parts) {
+    if (!part) continue
+    const nextPath = currentPath + path.sep + part
+    try {
+      const stat = fs.statSync(nextPath)
+      if (stat.isFile() || stat.isSymbolicLink()) {
+        return true
+      }
+    } catch {
+      break
+    }
+    currentPath = nextPath
+  }
+
+  return false
+}
+
+/**
+ * Find the first non-existent path component.
+ */
+function findFirstNonExistentComponent(targetPath: string): string {
+  const parts = targetPath.split(path.sep)
+  let currentPath = ''
+
+  for (const part of parts) {
+    if (!part) continue
+    const nextPath = currentPath + path.sep + part
+    if (!fs.existsSync(nextPath)) {
+      return nextPath
+    }
+    currentPath = nextPath
+  }
+
+  return targetPath
+}
 
 /**
  * Get mandatory deny paths using ripgrep (Linux only).
@@ -100,7 +137,7 @@ async function linuxGetMandatoryDenyPaths(
   }
   // Git hooks always blocked in nested repos
   iglobArgs.push('--iglob', '**/.git/hooks/**')
-  
+
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
     iglobArgs.push('--iglob', '**/.git/config')
@@ -167,38 +204,328 @@ async function linuxGetMandatoryDenyPaths(
   return [...new Set(denyPaths)]
 }
 
-// Track generated seccomp filters for cleanup on process exit
-const generatedSeccompFilters: Set<string> = new Set()
+// Track synthetic mount points created to deny non-existent paths. Bubblewrap
+// leaves these host-side mount points behind, so we need explicit cleanup.
+const bwrapMountPoints: Set<string> = new Set()
+
+// Cross-process reference tracking prevents one sandbox launch from cleaning up
+// a synthetic mount point while another concurrent launch is still using it.
+const mountPointStateDir = path.join(tmpdir(), 'claude-bwrap-mountpoint-state')
+const MOUNTPOINT_LOCK_RETRY_MS = 10
+const MOUNTPOINT_LOCK_TIMEOUT_MS = 5000
+const MOUNTPOINT_STALE_LOCK_MS = 10000
+
+type MountPointRefState = {
+  path: string
+  holders: Record<string, number>
+}
+
+const tempEmptyFiles: Set<string> = new Set()
 let exitHandlerRegistered = false
 
 /**
- * Register cleanup handler for generated seccomp filters
+ * Small busy wait for tiny cross-process lock windows.
  */
-function registerSeccompCleanupHandler(): void {
+function spinWait(ms: number): void {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    // Intentional busy wait.
+  }
+}
+
+function getMountPointStatePaths(mountPoint: string): {
+  statePath: string
+  lockPath: string
+} {
+  const key = createHash('sha256').update(mountPoint).digest('hex')
+  return {
+    statePath: path.join(mountPointStateDir, `${key}.json`),
+    lockPath: path.join(mountPointStateDir, `${key}.lock`),
+  }
+}
+
+function withMountPointStateLock<T>(
+  mountPoint: string,
+  fn: (statePath: string) => T,
+): T | null {
+  fs.mkdirSync(mountPointStateDir, { recursive: true })
+  const { statePath, lockPath } = getMountPointStatePaths(mountPoint)
+  const deadline = Date.now() + MOUNTPOINT_LOCK_TIMEOUT_MS
+  let lockFd: number | null = null
+
+  while (lockFd === null) {
+    try {
+      lockFd = fs.openSync(lockPath, 'wx')
+      break
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException
+      if (err.code !== 'EEXIST') {
+        throw error
+      }
+
+      try {
+        const lockStat = fs.statSync(lockPath)
+        if (Date.now() - lockStat.mtimeMs > MOUNTPOINT_STALE_LOCK_MS) {
+          fs.unlinkSync(lockPath)
+          continue
+        }
+      } catch {
+        // Lock vanished; retry.
+      }
+
+      if (Date.now() >= deadline) {
+        logForDebugging(
+          `[Sandbox Linux] Timed out waiting for mount point lock: ${mountPoint}`,
+          { level: 'error' },
+        )
+        return null
+      }
+      spinWait(MOUNTPOINT_LOCK_RETRY_MS)
+    }
+  }
+
+  try {
+    return fn(statePath)
+  } finally {
+    try {
+      fs.closeSync(lockFd)
+    } catch {
+      // Ignore close errors.
+    }
+    try {
+      fs.unlinkSync(lockPath)
+    } catch {
+      // Ignore unlock errors.
+    }
+  }
+}
+
+function readMountPointRefState(statePath: string): MountPointRefState | null {
+  try {
+    const raw = fs.readFileSync(statePath, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<MountPointRefState>
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof parsed.path !== 'string' ||
+      typeof parsed.holders !== 'object' ||
+      parsed.holders === null
+    ) {
+      return null
+    }
+
+    const holders: Record<string, number> = {}
+    for (const [pidKey, count] of Object.entries(parsed.holders)) {
+      if (typeof count === 'number' && Number.isInteger(count) && count > 0) {
+        holders[pidKey] = count
+      }
+    }
+
+    return { path: parsed.path, holders }
+  } catch {
+    return null
+  }
+}
+
+function writeMountPointRefState(
+  statePath: string,
+  state: MountPointRefState,
+): void {
+  const tmpStatePath = `${statePath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  fs.writeFileSync(tmpStatePath, JSON.stringify(state), 'utf8')
+  fs.renameSync(tmpStatePath, statePath)
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException
+    return err.code === 'EPERM'
+  }
+}
+
+function pruneDeadHolders(state: MountPointRefState): void {
+  for (const pidKey of Object.keys(state.holders)) {
+    const pid = Number(pidKey)
+    if (!isProcessAlive(pid)) {
+      delete state.holders[pidKey]
+    }
+  }
+}
+
+function getTotalHolderCount(state: MountPointRefState): number {
+  return Object.values(state.holders).reduce((sum, count) => sum + count, 0)
+}
+
+function removeMountPointIfPristine(mountPoint: string): void {
+  try {
+    const stat = fs.statSync(mountPoint)
+    if (stat.isFile() && stat.size === 0) {
+      fs.unlinkSync(mountPoint)
+      logForDebugging(
+        `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+      )
+    } else if (stat.isDirectory()) {
+      const entries = fs.readdirSync(mountPoint)
+      if (entries.length === 0) {
+        fs.rmdirSync(mountPoint)
+        logForDebugging(
+          `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
+        )
+      }
+    }
+  } catch {
+    // Ignore cleanup errors.
+  }
+}
+
+function acquireMountPointReference(mountPoint: string): void {
+  if (bwrapMountPoints.has(mountPoint)) {
+    return
+  }
+
+  const updated = withMountPointStateLock(mountPoint, statePath => {
+    const existingState = readMountPointRefState(statePath)
+    const state: MountPointRefState =
+      existingState && existingState.path === mountPoint
+        ? existingState
+        : { path: mountPoint, holders: {} }
+
+    pruneDeadHolders(state)
+
+    const pidKey = String(process.pid)
+    state.holders[pidKey] = (state.holders[pidKey] ?? 0) + 1
+    writeMountPointRefState(statePath, state)
+  })
+
+  if (updated === null) {
+    return
+  }
+
+  bwrapMountPoints.add(mountPoint)
+  registerExitCleanupHandler()
+}
+
+function acquireTrackedMountPointReferenceIfPresent(
+  mountPoint: string,
+): boolean {
+  if (bwrapMountPoints.has(mountPoint)) {
+    return true
+  }
+
+  const acquired = withMountPointStateLock(mountPoint, statePath => {
+    const state = readMountPointRefState(statePath)
+    if (!state || state.path !== mountPoint) {
+      return false
+    }
+
+    pruneDeadHolders(state)
+
+    const totalBefore = getTotalHolderCount(state)
+    if (totalBefore === 0) {
+      try {
+        fs.unlinkSync(statePath)
+      } catch {
+        // Ignore stale state cleanup errors.
+      }
+      removeMountPointIfPristine(mountPoint)
+      return false
+    }
+
+    const pidKey = String(process.pid)
+    state.holders[pidKey] = (state.holders[pidKey] ?? 0) + 1
+    writeMountPointRefState(statePath, state)
+    return true
+  })
+
+  if (acquired !== true) {
+    return false
+  }
+
+  bwrapMountPoints.add(mountPoint)
+  registerExitCleanupHandler()
+  return true
+}
+
+function releaseMountPointReference(mountPoint: string): void {
+  const released = withMountPointStateLock(mountPoint, statePath => {
+    const state = readMountPointRefState(statePath)
+    if (!state || state.path !== mountPoint) {
+      removeMountPointIfPristine(mountPoint)
+      return
+    }
+
+    pruneDeadHolders(state)
+
+    const pidKey = String(process.pid)
+    const currentCount = state.holders[pidKey] ?? 0
+    if (currentCount <= 1) {
+      delete state.holders[pidKey]
+    } else {
+      state.holders[pidKey] = currentCount - 1
+    }
+
+    if (getTotalHolderCount(state) === 0) {
+      try {
+        fs.unlinkSync(statePath)
+      } catch {
+        // Ignore state cleanup errors.
+      }
+      removeMountPointIfPristine(mountPoint)
+    } else {
+      writeMountPointRefState(statePath, state)
+    }
+  })
+
+  if (released === null) {
+    return
+  }
+}
+
+/**
+ * Register cleanup handler for bwrap mount points and temp files.
+ */
+function registerExitCleanupHandler(): void {
   if (exitHandlerRegistered) {
     return
   }
 
   process.on('exit', () => {
-    for (const filterPath of generatedSeccompFilters) {
-      try {
-        cleanupSeccompFilter(filterPath)
-      } catch {
-        // Ignore cleanup errors during exit
-      }
-    }
+    cleanupBwrapMountPoints()
+    cleanupTempEmptyFiles()
   })
 
   exitHandlerRegistered = true
+}
+
+export function cleanupBwrapMountPoints(): void {
+  for (const mountPoint of bwrapMountPoints) {
+    releaseMountPointReference(mountPoint)
+  }
+  bwrapMountPoints.clear()
+}
+
+export function cleanupTempEmptyFiles(): void {
+  for (const tmpFile of tempEmptyFiles) {
+    try {
+      fs.unlinkSync(tmpFile)
+    } catch {
+      // Ignore cleanup errors - temp files are best-effort
+    }
+  }
+  tempEmptyFiles.clear()
 }
 
 /**
  * Check if Linux sandbox dependencies are available (synchronous)
  * Returns true if bwrap and socat are installed.
  */
-export function hasLinuxSandboxDependenciesSync(
-  allowAllUnixSockets = false,
-): boolean {
+export function hasLinuxSandboxDependenciesSync(): boolean {
   try {
     const bwrapResult = spawnSync('which', ['bwrap'], {
       stdio: 'ignore',
@@ -209,29 +536,7 @@ export function hasLinuxSandboxDependenciesSync(
       timeout: 1000,
     })
 
-    const hasBasicDeps = bwrapResult.status === 0 && socatResult.status === 0
-
-    // Check for seccomp dependencies (optional security feature)
-    if (!allowAllUnixSockets) {
-      // Check if we have a pre-generated BPF filter for this architecture
-      const hasPreGeneratedBpf = getPreGeneratedBpfPath() !== null
-
-      // Check if we have the apply-seccomp binary for this architecture
-      const hasApplySeccompBinary = getApplySeccompBinaryPath() !== null
-
-      if (!hasPreGeneratedBpf || !hasApplySeccompBinary) {
-        // Seccomp not available - log warning but continue with basic sandbox
-        // The sandbox will gracefully fall back to allowAllUnixSockets mode
-        logForDebugging(
-          `[Sandbox Linux] Seccomp filtering not available (missing binaries for ${process.arch}). ` +
-            `Sandbox will run without Unix socket blocking (allowAllUnixSockets mode). ` +
-            `This is less restrictive but still provides filesystem and network isolation.`,
-          { level: 'warn' },
-        )
-      }
-    }
-
-    return hasBasicDeps
+    return bwrapResult.status === 0 && socatResult.status === 0
   } catch {
     return false
   }
@@ -399,7 +704,6 @@ function buildSandboxCommand(
   httpSocketPath: string,
   socksSocketPath: string,
   userCommand: string,
-  seccompFilterPath: string | undefined,
   shell?: string,
 ): string {
   // Default to bash for backward compatibility
@@ -410,46 +714,12 @@ function buildSandboxCommand(
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
-  // If seccomp filter is provided, use apply-seccomp to apply it
-  if (seccompFilterPath) {
-    // apply-seccomp approach:
-    // 1. Outer bwrap/bash: starts socat processes (can use Unix sockets)
-    // 2. apply-seccomp: applies seccomp filter and execs user command
-    // 3. User command runs with seccomp active (Unix sockets blocked)
-    //
-    // apply-seccomp is a simple C program that:
-    // - Sets PR_SET_NO_NEW_PRIVS
-    // - Applies the seccomp BPF filter via prctl(PR_SET_SECCOMP)
-    // - Execs the user command
-    //
-    // This is simpler and more portable than nested bwrap, with no FD redirects needed.
-    const applySeccompBinary = getApplySeccompBinaryPath()
-    if (!applySeccompBinary) {
-      throw new Error(
-        'apply-seccomp binary not found. This should have been caught earlier. ' +
-          'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-      )
-    }
+  const innerScript = [
+    ...socatCommands,
+    `eval ${shellquote.quote([userCommand])}`,
+  ].join('\n')
 
-    const applySeccompCmd = shellquote.quote([
-      applySeccompBinary,
-      seccompFilterPath,
-      shellPath,
-      '-c',
-      userCommand,
-    ])
-
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
-  } else {
-    // No seccomp filter - run user command directly
-    const innerScript = [
-      ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
-    ].join('\n')
-
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
-  }
+  return `${shellPath} -c ${shellquote.quote([innerScript])}`
 }
 
 /**
@@ -518,11 +788,49 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Skip non-existent paths
       if (!fs.existsSync(normalizedPath)) {
-        logForDebugging(
-          `[Sandbox Linux] Skipping non-existent deny path: ${normalizedPath}`,
+        if (hasFileAncestor(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping deny path with file ancestor: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        let ancestorPath = path.dirname(normalizedPath)
+        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
+          ancestorPath = path.dirname(ancestorPath)
+        }
+
+        const ancestorIsWithinAllowedPath = allowedWritePaths.some(
+          allowedPath =>
+            ancestorPath.startsWith(allowedPath + '/') ||
+            ancestorPath === allowedPath ||
+            normalizedPath.startsWith(allowedPath + '/'),
         )
+
+        if (ancestorIsWithinAllowedPath) {
+          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
+          if (firstNonExistent !== normalizedPath) {
+            const emptyDir = fs.mkdtempSync(
+              path.join(tmpdir(), 'claude-empty-'),
+            )
+            args.push('--ro-bind', emptyDir, firstNonExistent)
+            acquireMountPointReference(firstNonExistent)
+            logForDebugging(
+              `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          } else {
+            args.push('--ro-bind', '/dev/null', firstNonExistent)
+            acquireMountPointReference(firstNonExistent)
+            logForDebugging(
+              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          }
+        } else {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
+          )
+        }
         continue
       }
 
@@ -535,12 +843,65 @@ async function generateFilesystemArgs(
       )
 
       if (isWithinAllowedPath) {
+        acquireTrackedMountPointReferenceIfPresent(normalizedPath)
+
+        if (!fs.existsSync(normalizedPath)) {
+          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
+          if (firstNonExistent !== normalizedPath) {
+            const emptyDir = fs.mkdtempSync(
+              path.join(tmpdir(), 'claude-empty-'),
+            )
+            args.push('--ro-bind', emptyDir, firstNonExistent)
+            acquireMountPointReference(firstNonExistent)
+            logForDebugging(
+              `[Sandbox Linux] TOCTOU fallback: mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          } else {
+            args.push('--ro-bind', '/dev/null', firstNonExistent)
+            acquireMountPointReference(firstNonExistent)
+            logForDebugging(
+              `[Sandbox Linux] TOCTOU fallback: mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          }
+          continue
+        }
+
         args.push('--ro-bind', normalizedPath, normalizedPath)
       } else {
         logForDebugging(
           `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
         )
       }
+    }
+
+    for (const pathPattern of writeConfig.allowWithinDeny ?? []) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      if (normalizedPath.startsWith('/dev/')) {
+        continue
+      }
+
+      if (!fs.existsSync(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent allowWithinDeny write path: ${normalizedPath}`,
+        )
+        continue
+      }
+
+      const isWithinAllowedPath = allowedWritePaths.some(
+        allowedPath =>
+          normalizedPath.startsWith(allowedPath + '/') ||
+          normalizedPath === allowedPath,
+      )
+
+      if (!isWithinAllowedPath) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping allowWithinDeny write path not within allowed paths: ${normalizedPath}`,
+        )
+        continue
+      }
+
+      args.push('--bind', normalizedPath, normalizedPath)
     }
   } else {
     // No write restrictions: Allow all writes
@@ -575,54 +936,56 @@ async function generateFilesystemArgs(
     }
   }
 
+  for (const pathPattern of readConfig?.allowWithinDeny ?? []) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+    if (!fs.existsSync(normalizedPath)) {
+      logForDebugging(
+        `[Sandbox Linux] Skipping non-existent allowWithinDeny path: ${normalizedPath}`,
+      )
+      continue
+    }
+
+    args.push('--ro-bind', normalizedPath, normalizedPath)
+  }
+
+  for (const pathPattern of readConfig?.denyWithinAllow ?? []) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+    if (!fs.existsSync(normalizedPath)) {
+      logForDebugging(
+        `[Sandbox Linux] Skipping non-existent denyWithinAllow path: ${normalizedPath}`,
+      )
+      continue
+    }
+
+    const reDenyStat = fs.statSync(normalizedPath)
+    if (reDenyStat.isDirectory()) {
+      args.push('--tmpfs', normalizedPath)
+      continue
+    }
+
+    const tmpFile = path.join(
+      tmpdir(),
+      `srt-empty-${randomBytes(6).toString('hex')}`,
+    )
+    fs.writeFileSync(tmpFile, '')
+    tempEmptyFiles.add(tmpFile)
+    registerExitCleanupHandler()
+    args.push('--ro-bind', tmpFile, normalizedPath)
+  }
+
   return args
 }
 
 /**
  * Wrap a command with sandbox restrictions on Linux
  *
- * UNIX SOCKET BLOCKING (APPLY-SECCOMP):
- * This implementation uses a custom apply-seccomp binary to block Unix domain socket
- * creation for user commands while allowing network infrastructure:
+ * This implementation uses bwrap for filesystem, network, and process isolation.
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
+ * Stage 1: Outer bwrap - Network and filesystem isolation
  *   - Bubblewrap starts with isolated network namespace (--unshare-net)
  *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
  *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
  *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
- *
- * Stage 2: apply-seccomp - Seccomp filter application (ONLY seccomp)
- *   - apply-seccomp binary applies seccomp filter via prctl(PR_SET_SECCOMP)
- *   - Sets PR_SET_NO_NEW_PRIVS to allow seccomp without root
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
- *
- * This solves the conflict between:
- * - Security: Blocking arbitrary Unix socket creation in user commands
- * - Functionality: Network sandboxing requires socat to call socket(AF_UNIX, ...) for bridge connections
- *
- * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
- * - Creating new Unix domain socket file descriptors
- *
- * Security limitations:
- * - Does NOT block operations (bind, connect, sendto, etc.) on inherited Unix socket FDs
- * - Does NOT prevent passing Unix socket FDs via SCM_RIGHTS
- * - For most sandboxing use cases, blocking socket creation is sufficient
- *
- * The filter allows:
- * - All TCP/UDP sockets (AF_INET, AF_INET6) for normal network operations
- * - All other syscalls
- *
- * PLATFORM NOTE:
- * The allowUnixSockets configuration is not path-based on Linux (unlike macOS)
- * because seccomp-bpf cannot inspect user-space memory to read socket paths.
- *
- * Requirements for seccomp filtering:
- * - Pre-built apply-seccomp binaries are included for x64 and ARM64
- * - Pre-generated BPF filters are included for x64 and ARM64
- * - Other architectures are not currently supported (no apply-seccomp binary available)
- * - To use sandboxing without Unix socket blocking on unsupported architectures,
- *   set allowAllUnixSockets: true in your configuration
- * Dependencies are checked by hasLinuxSandboxDependenciesSync() before enabling the sandbox.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -637,7 +1000,6 @@ export async function wrapCommandWithSandboxLinux(
     readConfig,
     writeConfig,
     enableWeakerNestedSandbox,
-    allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
@@ -648,7 +1010,12 @@ export async function wrapCommandWithSandboxLinux(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions = Boolean(
+    readConfig &&
+      (readConfig.denyOnly.length > 0 ||
+        (readConfig.allowWithinDeny?.length ?? 0) > 0 ||
+        (readConfig.denyWithinAllow?.length ?? 0) > 0),
+  )
   const hasWriteRestrictions = writeConfig !== undefined
 
   // Check if we need any sandboxing
@@ -661,211 +1028,121 @@ export async function wrapCommandWithSandboxLinux(
   }
 
   const bwrapArgs: string[] = []
-  let seccompFilterPath: string | undefined = undefined
 
-  try {
-    // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
-    // Use bwrap's --seccomp flag to apply BPF filter that blocks Unix socket creation
-    //
-    // NOTE: Seccomp filtering is only enabled when allowAllUnixSockets is false
-    // (when true, Unix sockets are allowed)
-    if (!allowAllUnixSockets) {
-      seccompFilterPath = generateSeccompFilter() ?? undefined
-      if (!seccompFilterPath) {
-        // Seccomp not available - log warning and continue without it
-        // This provides graceful degradation on systems without seccomp binaries
-        logForDebugging(
-          '[Sandbox Linux] Seccomp filter not available (missing binaries). ' +
-            'Continuing without Unix socket blocking - sandbox will still provide ' +
-            'filesystem and network isolation but Unix sockets will be allowed.',
-          { level: 'warn' },
-        )
-      } else {
-        // Track filter for cleanup and register exit handler
-        // Only track runtime-generated filters (not pre-generated ones from vendor/)
-        if (!seccompFilterPath.includes('/vendor/seccomp/')) {
-          generatedSeccompFilters.add(seccompFilterPath)
-          registerSeccompCleanupHandler()
-        }
+  // ========== NETWORK RESTRICTIONS ==========
+  if (needsNetworkRestriction) {
+    // Always unshare network namespace to isolate network access
+    // This removes all network interfaces, effectively blocking all network
+    bwrapArgs.push('--unshare-net')
 
-        logForDebugging(
-          '[Sandbox Linux] Generated seccomp BPF filter for Unix socket blocking',
-        )
-      }
-    } else if (allowAllUnixSockets) {
-      logForDebugging(
-        '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
-      )
-    }
-
-    // ========== NETWORK RESTRICTIONS ==========
-    if (needsNetworkRestriction) {
-      // Always unshare network namespace to isolate network access
-      // This removes all network interfaces, effectively blocking all network
-      bwrapArgs.push('--unshare-net')
-
-      // If proxy sockets are provided, bind them into the sandbox to allow
-      // filtered network access through the proxy. If not provided, network
-      // is completely blocked (empty allowedDomains = block all)
-      if (httpSocketPath && socksSocketPath) {
-        // Verify socket files still exist before trying to bind them
-        if (!fs.existsSync(httpSocketPath)) {
-          throw new Error(
-            `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
-          )
-        }
-        if (!fs.existsSync(socksSocketPath)) {
-          throw new Error(
-            `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
-          )
-        }
-
-        // Bind both sockets into the sandbox
-        bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
-
-        // Add proxy environment variables
-        // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
-        // which forwards to the Unix socket that bridges to the host's proxy server
-        const proxyEnv = generateProxyEnvVars(
-          3128, // Internal HTTP listener port
-          1080, // Internal SOCKS listener port
-        )
-        bwrapArgs.push(
-          ...proxyEnv.flatMap((env: string) => {
-            const firstEq = env.indexOf('=')
-            const key = env.slice(0, firstEq)
-            const value = env.slice(firstEq + 1)
-            return ['--setenv', key, value]
-          }),
-        )
-
-        // Add host proxy port environment variables for debugging/transparency
-        // These show which host ports the Unix socket bridges connect to
-        if (httpProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
-            String(httpProxyPort),
-          )
-        }
-        if (socksProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
-            String(socksProxyPort),
-          )
-        }
-      }
-      // If no sockets provided, network is completely blocked (--unshare-net without proxy)
-    }
-
-    // ========== FILESYSTEM RESTRICTIONS ==========
-    const fsArgs = await generateFilesystemArgs(
-      readConfig,
-      writeConfig,
-      ripgrepConfig,
-      mandatoryDenySearchDepth,
-      allowGitConfig,
-      abortSignal,
-    )
-    bwrapArgs.push(...fsArgs)
-
-    // Always bind /dev
-    bwrapArgs.push('--dev', '/dev')
-
-    // ========== PID NAMESPACE ISOLATION ==========
-    // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work
-    // By default, always unshare PID namespace and mount fresh /proc.
-    // If we don't have --unshare-pid, it is possible to escape the sandbox.
-    // If we don't have --proc, it is possible to read host /proc and leak information about code running
-    // outside the sandbox. But, --proc is not available when running in unprivileged docker containers
-    // so we support running without it if explicitly requested.
-    bwrapArgs.push('--unshare-pid')
-    if (!enableWeakerNestedSandbox) {
-      // Mount fresh /proc if PID namespace is isolated (secure mode)
-      bwrapArgs.push('--proc', '/proc')
-    }
-
-    // ========== COMMAND ==========
-    // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
-    // Resolve the full path to the shell binary since bwrap doesn't use $PATH
-    const shellName = binShell || 'bash'
-    const shellPathResult = spawnSync('which', [shellName], {
-      encoding: 'utf8',
-    })
-    if (shellPathResult.status !== 0) {
-      throw new Error(`Shell '${shellName}' not found in PATH`)
-    }
-    const shell = shellPathResult.stdout.trim()
-    bwrapArgs.push('--', shell, '-c')
-
-    // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
-    // Otherwise, just run the command directly with apply-seccomp if needed
-    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
-      // This allows socat to start before seccomp is applied
-      const sandboxCommand = buildSandboxCommand(
-        httpSocketPath,
-        socksSocketPath,
-        command,
-        seccompFilterPath,
-        shell,
-      )
-      bwrapArgs.push(sandboxCommand)
-    } else if (seccompFilterPath) {
-      // No network restrictions but we have seccomp - use apply-seccomp directly
-      // apply-seccomp is a simple C program that applies the seccomp filter and execs the command
-      const applySeccompBinary = getApplySeccompBinaryPath()
-      if (!applySeccompBinary) {
+    // If proxy sockets are provided, bind them into the sandbox to allow
+    // filtered network access through the proxy. If not provided, network
+    // is completely blocked (empty allowedDomains = block all)
+    if (httpSocketPath && socksSocketPath) {
+      // Verify socket files still exist before trying to bind them
+      if (!fs.existsSync(httpSocketPath)) {
         throw new Error(
-          'apply-seccomp binary not found. This should have been caught earlier. ' +
-            'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
+          `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
+        )
+      }
+      if (!fs.existsSync(socksSocketPath)) {
+        throw new Error(
+          `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
         )
       }
 
-      const applySeccompCmd = shellquote.quote([
-        applySeccompBinary,
-        seccompFilterPath,
-        shell,
-        '-c',
-        command,
-      ])
-      bwrapArgs.push(applySeccompCmd)
-    } else {
-      bwrapArgs.push(command)
-    }
+      // Bind both sockets into the sandbox
+      bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
+      bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
 
-    // Build the outer bwrap command
-    const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
+      // Add proxy environment variables
+      // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
+      // which forwards to the Unix socket that bridges to the host's proxy server
+      const proxyEnv = generateProxyEnvVars(3128, 1080)
+      bwrapArgs.push(
+        ...proxyEnv.flatMap((env: string) => {
+          const firstEq = env.indexOf('=')
+          const key = env.slice(0, firstEq)
+          const value = env.slice(firstEq + 1)
+          return ['--setenv', key, value]
+        }),
+      )
 
-    const restrictions = []
-    if (needsNetworkRestriction) restrictions.push('network')
-    if (hasReadRestrictions || hasWriteRestrictions)
-      restrictions.push('filesystem')
-    if (seccompFilterPath) restrictions.push('seccomp(unix-block)')
-
-    logForDebugging(
-      `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
-    )
-
-    return wrappedCommand
-  } catch (error) {
-    // Clean up seccomp filter on error
-    if (seccompFilterPath && !seccompFilterPath.includes('/vendor/seccomp/')) {
-      generatedSeccompFilters.delete(seccompFilterPath)
-      try {
-        cleanupSeccompFilter(seccompFilterPath)
-      } catch (cleanupError) {
-        logForDebugging(
-          `[Sandbox Linux] Failed to clean up seccomp filter on error: ${cleanupError}`,
-          { level: 'error' },
+      // Add host proxy port environment variables for debugging/transparency
+      if (httpProxyPort !== undefined) {
+        bwrapArgs.push(
+          '--setenv',
+          'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
+          String(httpProxyPort),
+        )
+      }
+      if (socksProxyPort !== undefined) {
+        bwrapArgs.push(
+          '--setenv',
+          'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
+          String(socksProxyPort),
         )
       }
     }
-    // Re-throw the original error
-    throw error
+    // If no sockets provided, network is completely blocked (--unshare-net without proxy)
   }
+
+  // ========== FILESYSTEM RESTRICTIONS ==========
+  const fsArgs = await generateFilesystemArgs(
+    readConfig,
+    writeConfig,
+    ripgrepConfig,
+    mandatoryDenySearchDepth,
+    allowGitConfig,
+    abortSignal,
+  )
+  bwrapArgs.push(...fsArgs)
+
+  // Always bind /dev
+  bwrapArgs.push('--dev', '/dev')
+
+  // ========== PID NAMESPACE ISOLATION ==========
+  bwrapArgs.push('--unshare-pid')
+  if (!enableWeakerNestedSandbox) {
+    bwrapArgs.push('--proc', '/proc')
+  }
+
+  // ========== COMMAND ==========
+  const shellName = binShell || 'bash'
+  const shellPathResult = spawnSync('which', [shellName], {
+    encoding: 'utf8',
+  })
+  if (shellPathResult.status !== 0) {
+    throw new Error(`Shell '${shellName}' not found in PATH`)
+  }
+  const shell = shellPathResult.stdout.trim()
+  bwrapArgs.push('--', shell, '-c')
+
+  if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
+    const sandboxCommand = buildSandboxCommand(
+      httpSocketPath,
+      socksSocketPath,
+      command,
+      shell,
+    )
+    bwrapArgs.push(sandboxCommand)
+  } else {
+    bwrapArgs.push(command)
+  }
+
+  const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
+
+  const restrictions = []
+  if (needsNetworkRestriction) restrictions.push('network')
+  if (hasReadRestrictions || hasWriteRestrictions) {
+    restrictions.push('filesystem')
+  }
+
+  logForDebugging(
+    `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
+  )
+
+  return wrappedCommand
 }

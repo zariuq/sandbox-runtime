@@ -2,7 +2,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getPlatform } from '../../src/utils/platform.js'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  wrapCommandWithSandboxLinux,
+  cleanupTempEmptyFiles,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 
 /**
@@ -649,5 +652,269 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
       // Main config has example.com, so proxy should be set up
       expect(result).toContain('HTTP_PROXY')
     })
+  })
+})
+
+describe('read allowRead / denyReadWithinAllow (hole-punch pattern)', () => {
+  const command = 'echo hello'
+  const rootDir = `/tmp/srt-test-allowread-${Date.now()}`
+  const allowDir = `${rootDir}/allow`
+  const remaskedFile = `${allowDir}/hosts.yml`
+  const missingAllowPath = `${rootDir}/missing-allow`
+  const missingReDenyPath = `${allowDir}/missing.yml`
+
+  beforeAll(async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    fs.mkdirSync(allowDir, { recursive: true })
+    fs.writeFileSync(remaskedFile, 'secret')
+  })
+
+  afterAll(async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    cleanupTempEmptyFiles()
+    fs.rmSync(rootDir, { recursive: true, force: true })
+  })
+
+  it('allowWithinDeny emits --ro-bind after --tmpfs', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: [rootDir],
+        allowWithinDeny: [allowDir],
+      },
+      writeConfig: undefined,
+    })
+
+    const denyIndex = result.indexOf(`--tmpfs ${rootDir}`)
+    const allowIndex = result.indexOf(`--ro-bind ${allowDir} ${allowDir}`)
+
+    expect(denyIndex).toBeGreaterThan(-1)
+    expect(allowIndex).toBeGreaterThan(denyIndex)
+  })
+
+  it('denyWithinAllow emits a temp file remask after allowWithinDeny', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: [rootDir],
+        allowWithinDeny: [allowDir],
+        denyWithinAllow: [remaskedFile],
+      },
+      writeConfig: undefined,
+    })
+
+    const escapedFile = remaskedFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const remaskMatch = result.match(
+      new RegExp(`--ro-bind ([^ ]+) ${escapedFile}`),
+    )
+    const allowIndex = result.indexOf(`--ro-bind ${allowDir} ${allowDir}`)
+    const remaskIndex = remaskMatch?.index ?? -1
+
+    expect(remaskMatch).not.toBeNull()
+    expect(remaskMatch?.[1]).not.toBe('/dev/null')
+    expect(remaskIndex).toBeGreaterThan(allowIndex)
+  })
+
+  it('allowWithinDeny skips non-existent paths', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: [rootDir],
+        allowWithinDeny: [missingAllowPath],
+      },
+      writeConfig: undefined,
+    })
+
+    expect(result).not.toContain(missingAllowPath)
+  })
+
+  it('denyWithinAllow skips non-existent paths', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: [rootDir],
+        allowWithinDeny: [allowDir],
+        denyWithinAllow: [missingReDenyPath],
+      },
+      writeConfig: undefined,
+    })
+
+    expect(result).not.toContain(missingReDenyPath)
+  })
+})
+
+describe('write allowWriteWithinDeny (hole-punch pattern)', () => {
+  const command = 'echo hello'
+  const rootDir = `/tmp/srt-test-allowwrite-${Date.now()}`
+  const allowDir = `${rootDir}/allow`
+  const missingAllowPath = `${rootDir}/missing-allow`
+
+  beforeAll(async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    fs.mkdirSync(allowDir, { recursive: true })
+  })
+
+  afterAll(async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    fs.rmSync(rootDir, { recursive: true, force: true })
+  })
+
+  it('allowWithinDeny emits --bind after a broader deny re-mask', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: {
+        allowOnly: [rootDir],
+        denyWithinAllow: [rootDir],
+        allowWithinDeny: [allowDir],
+      },
+    })
+
+    const denyIndex = result.indexOf(`--ro-bind ${rootDir} ${rootDir}`)
+    const allowIndex = result.indexOf(`--bind ${allowDir} ${allowDir}`)
+
+    expect(denyIndex).toBeGreaterThan(-1)
+    expect(allowIndex).toBeGreaterThan(denyIndex)
+  })
+
+  it('allowWithinDeny skips non-existent write carve-outs', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: {
+        allowOnly: [rootDir],
+        denyWithinAllow: [rootDir],
+        allowWithinDeny: [missingAllowPath],
+      },
+    })
+
+    expect(result).not.toContain(missingAllowPath)
+  })
+})
+
+describe('linux seccomp-free wrapper behavior', () => {
+  const command = 'echo hello'
+
+  it('does not include apply-seccomp when proxying network traffic', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const rootDir = `/tmp/srt-test-net-${Date.now()}`
+    const httpSocketPath = `${rootDir}/http.sock`
+    const socksSocketPath = `${rootDir}/socks.sock`
+    const fs = await import('fs')
+
+    try {
+      fs.mkdirSync(rootDir, { recursive: true })
+      fs.writeFileSync(httpSocketPath, '')
+      fs.writeFileSync(socksSocketPath, '')
+
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: true,
+        httpSocketPath,
+        socksSocketPath,
+        httpProxyPort: 3128,
+        socksProxyPort: 1080,
+        readConfig: undefined,
+        writeConfig: undefined,
+      })
+
+      expect(result).not.toContain('apply-seccomp')
+      expect(result).toContain(`UNIX-CONNECT:${httpSocketPath}`)
+      expect(result).toContain(`UNIX-CONNECT:${socksSocketPath}`)
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('macOS allowWriteWithinDeny warning', () => {
+  it('warns once when write carve-outs are supplied to the macOS wrapper', async () => {
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message))
+    }
+
+    try {
+      wrapCommandWithSandboxMacOS({
+        command: 'echo hello',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: {
+          allowOnly: ['.'],
+          denyWithinAllow: ['.'],
+          allowWithinDeny: ['./.claude'],
+        },
+      })
+
+      wrapCommandWithSandboxMacOS({
+        command: 'echo again',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: {
+          allowOnly: ['.'],
+          denyWithinAllow: ['.'],
+          allowWithinDeny: ['./.config'],
+        },
+      })
+    } finally {
+      console.warn = originalWarn
+    }
+
+    const macWarning = warnings.filter(message =>
+      message.includes('allowWriteWithinDeny'),
+    )
+
+    expect(macWarning.length).toBe(1)
+    expect(macWarning[0]).toContain('ignored on macOS')
   })
 })

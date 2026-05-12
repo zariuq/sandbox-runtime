@@ -1,7 +1,7 @@
+import shellquote from 'shell-quote'
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
-import { getPlatform } from '../utils/platform.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -166,6 +166,7 @@ export function generateProxyEnvVars(
   socksProxyPort?: number,
 ): string[] {
   const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=/tmp/claude`]
+  const loopbackHost = '127.0.0.1'
 
   // If no proxy ports provided, return minimal env vars
   if (!httpProxyPort && !socksProxyPort) {
@@ -188,32 +189,29 @@ export function generateProxyEnvVars(
   envVars.push(`no_proxy=${noProxyAddresses}`)
 
   if (httpProxyPort) {
-    envVars.push(`HTTP_PROXY=http://localhost:${httpProxyPort}`)
-    envVars.push(`HTTPS_PROXY=http://localhost:${httpProxyPort}`)
+    envVars.push(`HTTP_PROXY=http://${loopbackHost}:${httpProxyPort}`)
+    envVars.push(`HTTPS_PROXY=http://${loopbackHost}:${httpProxyPort}`)
     // Lowercase versions for compatibility with some tools
-    envVars.push(`http_proxy=http://localhost:${httpProxyPort}`)
-    envVars.push(`https_proxy=http://localhost:${httpProxyPort}`)
+    envVars.push(`http_proxy=http://${loopbackHost}:${httpProxyPort}`)
+    envVars.push(`https_proxy=http://${loopbackHost}:${httpProxyPort}`)
   }
 
   if (socksProxyPort) {
     // Use socks5h:// for proper DNS resolution through proxy
-    envVars.push(`ALL_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`all_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`ALL_PROXY=socks5h://${loopbackHost}:${socksProxyPort}`)
+    envVars.push(`all_proxy=socks5h://${loopbackHost}:${socksProxyPort}`)
 
-    // Configure Git to use SSH through SOCKS proxy (platform-aware)
-    if (getPlatform() === 'macos') {
-      // macOS has nc available
-      envVars.push(
-        `GIT_SSH_COMMAND="ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'"`,
-      )
-    }
+    envVars.push(
+      `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x ${loopbackHost}:${socksProxyPort} %h %p' -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/srt-ssh-known-hosts`,
+    )
+    envVars.push('SSH_ASKPASS_REQUIRE=never')
 
     // FTP proxy support (use socks5h for DNS resolution through proxy)
-    envVars.push(`FTP_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`ftp_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`FTP_PROXY=socks5h://${loopbackHost}:${socksProxyPort}`)
+    envVars.push(`ftp_proxy=socks5h://${loopbackHost}:${socksProxyPort}`)
 
     // rsync proxy support
-    envVars.push(`RSYNC_PROXY=localhost:${socksProxyPort}`)
+    envVars.push(`RSYNC_PROXY=${loopbackHost}:${socksProxyPort}`)
 
     // Database tools NOTE: Most database clients don't have built-in proxy support
     // You typically need to use SSH tunneling or a SOCKS wrapper like tsocks/proxychains
@@ -221,10 +219,10 @@ export function generateProxyEnvVars(
     // Docker CLI uses HTTP for the API
     // This makes Docker use the HTTP proxy for registry operations
     envVars.push(
-      `DOCKER_HTTP_PROXY=http://localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTP_PROXY=http://${loopbackHost}:${httpProxyPort || socksProxyPort}`,
     )
     envVars.push(
-      `DOCKER_HTTPS_PROXY=http://localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTPS_PROXY=http://${loopbackHost}:${httpProxyPort || socksProxyPort}`,
     )
 
     // Kubernetes kubectl - uses standard HTTPS_PROXY
@@ -237,7 +235,7 @@ export function generateProxyEnvVars(
     // Use HTTPS proxy to match other HTTP-based tools
     if (httpProxyPort) {
       envVars.push(`CLOUDSDK_PROXY_TYPE=https`)
-      envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
+      envVars.push(`CLOUDSDK_PROXY_ADDRESS=${loopbackHost}`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
     }
 
@@ -248,8 +246,8 @@ export function generateProxyEnvVars(
     // Terraform respects HTTP_PROXY/HTTPS_PROXY which we already set above
 
     // gRPC-based tools - use standard proxy vars
-    envVars.push(`GRPC_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`grpc_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`GRPC_PROXY=socks5h://${loopbackHost}:${socksProxyPort}`)
+    envVars.push(`grpc_proxy=socks5h://${loopbackHost}:${socksProxyPort}`)
   }
 
   // WARNING: Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs when only SOCKS proxy is available
@@ -257,6 +255,22 @@ export function generateProxyEnvVars(
   // to avoid overriding the client otherwise respecting the ALL_PROXY env var which points to SOCKS.
 
   return envVars
+}
+
+/**
+ * Format KEY=value environment assignments for use in a shell `export` command.
+ * Values are shell-quoted so variables like GIT_SSH_COMMAND survive round-trips
+ * through `/bin/sh -c` while Linux can still consume the raw values via `--setenv`.
+ */
+export function formatEnvVarsForShellExport(envVars: string[]): string {
+  const assignments = envVars.map(env => {
+    const firstEq = env.indexOf('=')
+    const key = env.slice(0, firstEq)
+    const value = env.slice(firstEq + 1)
+    return `${key}=${shellquote.quote([value])}`
+  })
+
+  return `export ${assignments.join(' ')}`
 }
 
 /**

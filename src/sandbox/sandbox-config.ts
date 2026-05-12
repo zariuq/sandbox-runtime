@@ -83,12 +83,14 @@ export const NetworkConfigSchema = z.object({
   allowUnixSockets: z
     .array(z.string())
     .optional()
-    .describe('Unix socket paths that are allowed (macOS only)'),
+    .describe(
+      'Unix socket paths that are allowed on macOS. Linux currently allows Unix sockets unconditionally.',
+    ),
   allowAllUnixSockets: z
     .boolean()
     .optional()
     .describe(
-      'Allow ALL Unix sockets (Linux only - disables Unix socket blocking)',
+      'Allow all Unix sockets. On macOS this disables Unix socket restrictions; on Linux it is accepted for backward compatibility and is currently a no-op.',
     ),
   allowLocalBinding: z
     .boolean()
@@ -119,12 +121,29 @@ export const NetworkConfigSchema = z.object({
  */
 export const FilesystemConfigSchema = z.object({
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  allowRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths allowed for reading even if a parent path is denied for reading',
+    ),
+  denyReadWithinAllow: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe('Paths denied for reading again within an allowRead re-exposure'),
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
+  allowWriteWithinDeny: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths allowed for writing again within a denyWrite re-mask. ' +
+        'Useful for broad write denies with narrow writable carve-outs (Linux only).',
+    ),
   allowGitConfig: z
     .boolean()
     .optional()
