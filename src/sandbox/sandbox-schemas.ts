@@ -8,6 +8,7 @@
  * - `{denyOnly: []}` = no restrictions (empty deny list = allow all reads)
  * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
  * - `allowWithinDeny` = re-expose subpaths after a broader deny
+ * - `allowExecWithinDeny` = execution-specific read carve-outs derived from executable entrypoints
  * - `denyWithinAllow` = re-hide specific paths after an allowWithinDeny re-exposure
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
@@ -15,6 +16,7 @@
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
+  allowExecWithinDeny?: string[]
   denyWithinAllow?: string[]
 }
 

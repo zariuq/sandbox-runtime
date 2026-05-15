@@ -127,6 +127,13 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Paths allowed for reading even if a parent path is denied for reading',
     ),
+  allowExec: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Executable entrypoints that should remain runnable even if their symlink targets or runtime prefixes live under denied read paths. ' +
+        'SRT expands each entry into narrow read carve-outs for the resolved executable, common user-space runtime roots, and absolute shebang interpreters.',
+    ),
   denyReadWithinAllow: z
     .array(filesystemPathSchema)
     .optional()

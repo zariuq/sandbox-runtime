@@ -71,6 +71,28 @@ export function removeTrailingGlobSuffix(pathPattern: string): string {
   return pathPattern.replace(/\/\*\*$/, '')
 }
 
+function normalizePathWithoutResolvingSymlinks(pathPattern: string): string {
+  const cwd = process.cwd()
+
+  if (pathPattern === '~') {
+    return homedir()
+  }
+
+  if (pathPattern.startsWith('~/')) {
+    return homedir() + pathPattern.slice(1)
+  }
+
+  if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
+    return path.resolve(cwd, pathPattern)
+  }
+
+  if (!path.isAbsolute(pathPattern)) {
+    return path.resolve(cwd, pathPattern)
+  }
+
+  return pathPattern
+}
+
 /**
  * Normalize a path for use in sandbox configurations
  * Handles:
@@ -83,21 +105,7 @@ export function removeTrailingGlobSuffix(pathPattern: string): string {
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  */
 export function normalizePathForSandbox(pathPattern: string): string {
-  const cwd = process.cwd()
-  let normalizedPath = pathPattern
-
-  // Expand ~ to home directory
-  if (pathPattern === '~') {
-    normalizedPath = homedir()
-  } else if (pathPattern.startsWith('~/')) {
-    normalizedPath = homedir() + pathPattern.slice(1)
-  } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
-    // Convert relative to absolute based on current working directory
-    normalizedPath = path.resolve(cwd, pathPattern)
-  } else if (!path.isAbsolute(pathPattern)) {
-    // Handle other relative paths (e.g., ".", "..", "foo/bar")
-    normalizedPath = path.resolve(cwd, pathPattern)
-  }
+  let normalizedPath = normalizePathWithoutResolvingSymlinks(pathPattern)
 
   // For glob patterns, resolve symlinks for the directory portion only
   if (containsGlobChars(normalizedPath)) {
@@ -131,6 +139,147 @@ export function normalizePathForSandbox(pathPattern: string): string {
   }
 
   return normalizedPath
+}
+
+function getUserSpaceRuntimeRoot(executablePath: string): string | undefined {
+  const binDir = path.dirname(executablePath)
+  if (path.basename(binDir) !== 'bin') {
+    return undefined
+  }
+
+  const runtimeRoot = path.dirname(binDir)
+  if (runtimeRoot === path.sep) {
+    return undefined
+  }
+
+  const homeDir = homedir()
+  const allowedPrefixes = [homeDir, '/tmp', '/private/tmp']
+  if (
+    !allowedPrefixes.some(
+      prefix =>
+        runtimeRoot === prefix || runtimeRoot.startsWith(prefix + path.sep),
+    )
+  ) {
+    return undefined
+  }
+
+  const markerPaths = [
+    path.join(runtimeRoot, 'pyvenv.cfg'),
+    path.join(runtimeRoot, 'conda-meta'),
+    path.join(runtimeRoot, 'lib'),
+  ]
+
+  return markerPaths.some(marker => fs.existsSync(marker))
+    ? runtimeRoot
+    : undefined
+}
+
+function parseAbsoluteShebangInterpreter(filePath: string): string | undefined {
+  try {
+    const fileContents = fs.readFileSync(filePath, 'utf8')
+    const firstLine = fileContents.split('\n', 1)[0]
+    if (!firstLine.startsWith('#!')) {
+      return undefined
+    }
+
+    const shebang = firstLine.slice(2).trim()
+    if (shebang.length === 0) {
+      return undefined
+    }
+
+    const [interpreterPath] = shebang.split(/\s+/, 1)
+    return interpreterPath.startsWith('/') ? interpreterPath : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Expand executable entrypoints into the narrow read carve-outs needed to run them
+ * inside a read-restricted sandbox:
+ * - the lexical path the caller configured
+ * - the resolved executable target
+ * - common user-space runtime roots for virtualenv/conda-style layouts
+ * - absolute shebang interpreters plus their runtime roots
+ */
+export function getExecutableReadPathsForSandbox(
+  executablePathPatterns: string[],
+): string[] {
+  const expandedPaths = new Set<string>()
+  const queue: string[] = []
+  const inspectedFiles = new Set<string>()
+
+  const enqueuePath = (pathPattern: string): void => {
+    if (!pathPattern) {
+      return
+    }
+
+    if (!expandedPaths.has(pathPattern)) {
+      expandedPaths.add(pathPattern)
+    }
+
+    if (!queue.includes(pathPattern)) {
+      queue.push(pathPattern)
+    }
+  }
+
+  const addRuntimeRoot = (filePath: string): void => {
+    const runtimeRoot = getUserSpaceRuntimeRoot(filePath)
+    if (runtimeRoot) {
+      expandedPaths.add(runtimeRoot)
+    }
+  }
+
+  for (const pathPattern of executablePathPatterns) {
+    const lexicalPath = normalizePathWithoutResolvingSymlinks(pathPattern)
+    enqueuePath(lexicalPath)
+
+    try {
+      enqueuePath(fs.realpathSync(lexicalPath))
+    } catch {
+      // Keep the lexical path even if the target is absent.
+    }
+  }
+
+  while (queue.length > 0) {
+    const filePath = queue.shift()
+    if (!filePath || inspectedFiles.has(filePath)) {
+      continue
+    }
+    inspectedFiles.add(filePath)
+
+    if (!fs.existsSync(filePath)) {
+      continue
+    }
+
+    let stat: fs.Stats
+    try {
+      stat = fs.statSync(filePath)
+    } catch {
+      continue
+    }
+
+    if (!stat.isFile()) {
+      continue
+    }
+
+    addRuntimeRoot(filePath)
+
+    const interpreterPath = parseAbsoluteShebangInterpreter(filePath)
+    if (!interpreterPath) {
+      continue
+    }
+
+    enqueuePath(interpreterPath)
+
+    try {
+      enqueuePath(fs.realpathSync(interpreterPath))
+    } catch {
+      // Keep the lexical interpreter path if the target is absent.
+    }
+  }
+
+  return [...expandedPaths]
 }
 
 /**

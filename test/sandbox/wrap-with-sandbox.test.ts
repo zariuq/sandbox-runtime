@@ -7,6 +7,7 @@ import {
   cleanupTempEmptyFiles,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import { getExecutableReadPathsForSandbox } from '../../src/sandbox/sandbox-utils.js'
 
 /**
  * Create a test configuration with network access
@@ -768,6 +769,94 @@ describe('read allowRead / denyReadWithinAllow (hole-punch pattern)', () => {
     })
 
     expect(result).not.toContain(missingReDenyPath)
+  })
+})
+
+describe('read allowExec expansion', () => {
+  const command = 'echo hello'
+  const rootDir = `/tmp/srt-test-allowexec-${Date.now()}`
+  const launcherDir = `${rootDir}/localbin`
+  const launcherPath = `${launcherDir}/lean-lsp-mcp`
+  const toolRoot = `${rootDir}/uv/tools/lean-lsp-mcp`
+  const toolScript = `${toolRoot}/bin/lean-lsp-mcp`
+  const toolPython = `${toolRoot}/bin/python`
+  const interpreterRoot = `${rootDir}/miniconda3`
+  const interpreterPath = `${interpreterRoot}/bin/python3`
+
+  beforeAll(async () => {
+    const fs = await import('fs')
+    fs.mkdirSync(launcherDir, { recursive: true })
+    fs.mkdirSync(`${toolRoot}/bin`, { recursive: true })
+    fs.mkdirSync(`${toolRoot}/lib`, { recursive: true })
+    fs.mkdirSync(`${interpreterRoot}/bin`, { recursive: true })
+    fs.mkdirSync(`${interpreterRoot}/lib`, { recursive: true })
+    fs.writeFileSync(toolScript, `#!${toolPython}\nprint("lean-lsp-mcp")\n`)
+    fs.writeFileSync(interpreterPath, '#!/bin/sh\nexit 0\n')
+    fs.symlinkSync(interpreterPath, toolPython)
+    fs.symlinkSync(toolScript, launcherPath)
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    const fs = await import('fs')
+    fs.rmSync(rootDir, { recursive: true, force: true })
+  })
+
+  it('expands symlinked executable entrypoints into runtime read carve-outs', () => {
+    const expandedPaths = getExecutableReadPathsForSandbox([launcherPath])
+
+    expect(expandedPaths).toEqual(
+      expect.arrayContaining([
+        launcherPath,
+        toolRoot,
+        toolScript,
+        toolPython,
+        interpreterRoot,
+        interpreterPath,
+      ]),
+    )
+  })
+
+  it('re-exposes allowExec paths after a broader read deny on Linux', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [rootDir],
+        allowExec: [launcherPath],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+
+    const readConfig = SandboxManager.getFsReadConfig()
+    expect(readConfig.allowExecWithinDeny).toEqual(
+      expect.arrayContaining([toolRoot, interpreterRoot]),
+    )
+
+    const result = await wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      readConfig,
+      writeConfig: undefined,
+    })
+
+    const denyIndex = result.indexOf(`--tmpfs ${rootDir}`)
+    const toolRootIndex = result.indexOf(`--ro-bind ${toolRoot} ${toolRoot}`)
+    const interpreterRootIndex = result.indexOf(
+      `--ro-bind ${interpreterRoot} ${interpreterRoot}`,
+    )
+
+    expect(denyIndex).toBeGreaterThan(-1)
+    expect(toolRootIndex).toBeGreaterThan(denyIndex)
+    expect(interpreterRootIndex).toBeGreaterThan(denyIndex)
   })
 })
 

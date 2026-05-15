@@ -27,6 +27,7 @@ import {
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  getExecutableReadPathsForSandbox,
   removeTrailingGlobSuffix,
 } from './sandbox-utils.js'
 import { hasRipgrepSync } from '../utils/ripgrep.js'
@@ -394,9 +395,30 @@ function checkDependencies(ripgrepConfig?: {
   return true
 }
 
+function getExpandedAllowReadPaths(filesystemConfig?: {
+  allowRead?: string[]
+  allowExec?: string[]
+}): string[] {
+  return [
+    ...(filesystemConfig?.allowRead ?? []),
+    ...getExpandedAllowExecPaths(filesystemConfig),
+  ]
+}
+
+function getExpandedAllowExecPaths(filesystemConfig?: {
+  allowExec?: string[]
+}): string[] {
+  return getExecutableReadPathsForSandbox(filesystemConfig?.allowExec ?? [])
+}
+
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
-    return { denyOnly: [], allowWithinDeny: [], denyWithinAllow: [] }
+    return {
+      denyOnly: [],
+      allowWithinDeny: [],
+      allowExecWithinDeny: [],
+      denyWithinAllow: [],
+    }
   }
 
   // Filter out glob patterns on Linux
@@ -410,7 +432,17 @@ function getFsReadConfig(): FsReadRestrictionConfig {
       return true
     })
 
-  const allowPaths = (config.filesystem.allowRead ?? [])
+  const allowPaths = getExpandedAllowReadPaths(config.filesystem)
+    .map(path => removeTrailingGlobSuffix(path))
+    .filter(path => {
+      if (getPlatform() === 'linux' && containsGlobChars(path)) {
+        logForDebugging(`Skipping glob pattern on Linux: ${path}`)
+        return false
+      }
+      return true
+    })
+
+  const allowExecPaths = getExpandedAllowExecPaths(config.filesystem)
     .map(path => removeTrailingGlobSuffix(path))
     .filter(path => {
       if (getPlatform() === 'linux' && containsGlobChars(path)) {
@@ -433,6 +465,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
+    allowExecWithinDeny: allowExecPaths,
     denyWithinAllow: reDenyPaths,
   }
 }
@@ -591,11 +624,17 @@ async function wrapWithSandbox(
       config?.filesystem.allowWriteWithinDeny ??
       [],
   }
+  const expandedAllowReadPaths = getExpandedAllowReadPaths(
+    customConfig?.filesystem ?? config?.filesystem,
+  )
+  const expandedAllowExecPaths = getExpandedAllowExecPaths(
+    customConfig?.filesystem ?? config?.filesystem,
+  )
   const readConfig = {
     denyOnly:
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-    allowWithinDeny:
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+    allowWithinDeny: expandedAllowReadPaths,
+    allowExecWithinDeny: expandedAllowExecPaths,
     denyWithinAllow:
       customConfig?.filesystem?.denyReadWithinAllow ??
       config?.filesystem.denyReadWithinAllow ??

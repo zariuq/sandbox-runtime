@@ -99,6 +99,7 @@ describe('Config Validation', () => {
       filesystem: {
         denyRead: ['/etc/shadow'],
         allowRead: ['/etc'],
+        allowExec: ['/home/user/.local/bin/lean-lsp-mcp'],
         denyReadWithinAllow: ['/etc/shadow'],
         allowWrite: ['/tmp'],
         denyWrite: ['/etc'],

@@ -309,6 +309,8 @@ Uses two different patterns:
 **Read restrictions** (deny-only pattern) - all reads allowed by default:
 
 - `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
+- `filesystem.allowRead` - Re-expose specific paths inside a broader `denyRead`.
+- `filesystem.allowExec` - Keep specific executable entrypoints runnable even when their symlink targets or user-space runtime roots live under denied read paths.
 
 **Write restrictions** (allow-only pattern) - all writes denied by default:
 
@@ -330,6 +332,8 @@ Examples:
 - `"allowWrite": ["src/"]` - Allow write to entire `src/` directory
 - `"allowWrite": ["src/**/*.ts"]` - Allow write to all `.ts` files in `src/` and subdirectories
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
+- `"allowRead": ["~/.config/gh"]` - Re-expose a subdirectory inside a broader denied tree
+- `"allowExec": ["~/.local/bin/lean-lsp-mcp"]` - Keep a UV-installed launcher runnable without reopening all of `~/.local/share`
 - `"denyWrite": [".env"]` - Deny write to `.env` file (even if current directory is allowed)
 - `"allowWriteWithinDeny": ["src/generated/"]` - Re-allow a subdirectory inside a broader Linux `denyWrite`
 
@@ -503,6 +507,8 @@ Filesystem restrictions are enforced at the OS level:
 
   - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
   - Empty `denyRead: []` = full read access (nothing denied)
+  - `allowRead` re-opens narrow subpaths inside a denied tree
+  - `allowExec` derives narrow read carve-outs for symlinked launchers and absolute shebang interpreters in common user-space tool layouts
 
 - **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
   - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
