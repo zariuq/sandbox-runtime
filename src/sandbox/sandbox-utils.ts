@@ -176,19 +176,28 @@ function getUserSpaceRuntimeRoot(executablePath: string): string | undefined {
 
 function parseAbsoluteShebangInterpreter(filePath: string): string | undefined {
   try {
-    const fileContents = fs.readFileSync(filePath, 'utf8')
-    const firstLine = fileContents.split('\n', 1)[0]
-    if (!firstLine.startsWith('#!')) {
-      return undefined
-    }
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(256)
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0)
+      if (bytesRead < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) {
+        return undefined
+      }
 
-    const shebang = firstLine.slice(2).trim()
-    if (shebang.length === 0) {
-      return undefined
-    }
+      const firstLine = buf
+        .subarray(0, bytesRead)
+        .toString('utf8')
+        .split('\n', 1)[0]
+      const shebang = firstLine.slice(2).trim()
+      if (shebang.length === 0) {
+        return undefined
+      }
 
-    const [interpreterPath] = shebang.split(/\s+/, 1)
-    return interpreterPath.startsWith('/') ? interpreterPath : undefined
+      const [interpreterPath] = shebang.split(/\s+/, 1)
+      return interpreterPath.startsWith('/') ? interpreterPath : undefined
+    } finally {
+      fs.closeSync(fd)
+    }
   } catch {
     return undefined
   }

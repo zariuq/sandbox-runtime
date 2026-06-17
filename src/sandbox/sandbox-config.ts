@@ -55,6 +55,41 @@ const domainPatternSchema = z.string().refine(
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
 
+export const DeviceAccessClassSchema = z.enum([
+  'gpu',
+  'kvm',
+  'fuse',
+  'tun',
+  'serial',
+  'video',
+  'usb',
+  'input',
+  'tpm',
+  'vfio',
+  'rawBlock',
+])
+
+export const DeviceAccessConfigSchema = z.object({
+  allowAll: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow all known host device classes except those explicitly denied (default: true).',
+    ),
+  allow: z
+    .array(DeviceAccessClassSchema)
+    .optional()
+    .describe(
+      'Device classes to expose when allowAll is false. Ignored when allowAll is true.',
+    ),
+  deny: z
+    .array(DeviceAccessClassSchema)
+    .optional()
+    .describe(
+      'Device classes to hide when allowAll is true, or to subtract from allow when allowAll is false.',
+    ),
+})
+
 /**
  * Network configuration schema for validation
  */
@@ -192,6 +227,9 @@ export const SandboxRuntimeConfigSchema = z.object({
   filesystem: FilesystemConfigSchema.describe(
     'Filesystem restrictions configuration',
   ),
+  devices: DeviceAccessConfigSchema.optional().describe(
+    'Host device passthrough policy for Linux sandboxes',
+  ),
   ignoreViolations: IgnoreViolationsConfigSchema.optional().describe(
     'Optional configuration for ignoring specific violations',
   ),
@@ -221,6 +259,8 @@ export const SandboxRuntimeConfigSchema = z.object({
 // Export inferred types
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
+export type DeviceAccessClass = z.infer<typeof DeviceAccessClassSchema>
+export type DeviceAccessConfig = z.infer<typeof DeviceAccessConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >

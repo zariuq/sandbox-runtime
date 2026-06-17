@@ -51,6 +51,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let expandedAllowExecCache: { key: string; value: string[] } | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -408,7 +409,19 @@ function getExpandedAllowReadPaths(filesystemConfig?: {
 function getExpandedAllowExecPaths(filesystemConfig?: {
   allowExec?: string[]
 }): string[] {
-  return getExecutableReadPathsForSandbox(filesystemConfig?.allowExec ?? [])
+  const allowExec = filesystemConfig?.allowExec ?? []
+  const cacheKey = JSON.stringify(allowExec)
+
+  if (expandedAllowExecCache?.key === cacheKey) {
+    return expandedAllowExecCache.value
+  }
+
+  const expandedPaths = getExecutableReadPathsForSandbox(allowExec)
+  expandedAllowExecCache = {
+    key: cacheKey,
+    value: expandedPaths,
+  }
+  return expandedPaths
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
@@ -567,6 +580,10 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+function getDeviceConfig() {
+  return config?.devices
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -679,6 +696,7 @@ async function wrapWithSandbox(
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const deviceConfig = customConfig?.devices ?? getDeviceConfig()
 
   switch (platform) {
     case 'macos':
@@ -724,6 +742,7 @@ async function wrapWithSandbox(
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
         allowGitConfig: getAllowGitConfig(),
+        deviceConfig,
         abortSignal,
       })
 

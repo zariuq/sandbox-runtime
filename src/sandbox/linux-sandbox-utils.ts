@@ -18,6 +18,7 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+import type { DeviceAccessClass, DeviceAccessConfig } from './sandbox-config.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -44,12 +45,123 @@ export interface LinuxSandboxParams {
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
+  /** Host device passthrough policy (default: allow all discovered classes) */
+  deviceConfig?: DeviceAccessConfig
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+const LINUX_DEVICE_EXACT_PATHS: Array<{
+  deviceClass: DeviceAccessClass
+  path: string
+}> = [
+  { deviceClass: 'gpu', path: '/dev/dri' },
+  { deviceClass: 'gpu', path: '/dev/kfd' },
+  { deviceClass: 'gpu', path: '/dev/dxg' },
+  { deviceClass: 'gpu', path: '/dev/nvidia-caps' },
+  { deviceClass: 'kvm', path: '/dev/kvm' },
+  { deviceClass: 'fuse', path: '/dev/fuse' },
+  { deviceClass: 'tun', path: '/dev/net/tun' },
+  { deviceClass: 'usb', path: '/dev/bus/usb' },
+  { deviceClass: 'input', path: '/dev/input' },
+  { deviceClass: 'vfio', path: '/dev/vfio' },
+]
+
+const LINUX_DEVICE_PREFIX_MAPPINGS: Array<{
+  deviceClass: DeviceAccessClass
+  prefix: string
+}> = [
+  { deviceClass: 'gpu', prefix: 'nvidia' },
+  { deviceClass: 'serial', prefix: 'ttyUSB' },
+  { deviceClass: 'serial', prefix: 'ttyACM' },
+  { deviceClass: 'video', prefix: 'video' },
+  { deviceClass: 'video', prefix: 'media' },
+  { deviceClass: 'tpm', prefix: 'tpm' },
+  { deviceClass: 'tpm', prefix: 'tpmrm' },
+  { deviceClass: 'rawBlock', prefix: 'sd' },
+  { deviceClass: 'rawBlock', prefix: 'nvme' },
+  { deviceClass: 'rawBlock', prefix: 'dm-' },
+  { deviceClass: 'rawBlock', prefix: 'loop' },
+]
+
+function isLinuxDeviceClassAllowed(
+  deviceClass: DeviceAccessClass,
+  deviceConfig: DeviceAccessConfig | undefined,
+): boolean {
+  const allowAll = deviceConfig?.allowAll ?? true
+  const allowedSet = new Set(deviceConfig?.allow ?? [])
+  const deniedSet = new Set(deviceConfig?.deny ?? [])
+
+  if (allowAll) {
+    return !deniedSet.has(deviceClass)
+  }
+
+  return allowedSet.has(deviceClass) && !deniedSet.has(deviceClass)
+}
+
+function getLinuxHostDevicePassthroughEntries(
+  deviceConfig: DeviceAccessConfig | undefined,
+): Array<{ deviceClass: DeviceAccessClass; path: string }> {
+  const passthroughEntries = new Map<string, DeviceAccessClass>()
+
+  for (const { deviceClass, path: devicePath } of LINUX_DEVICE_EXACT_PATHS) {
+    if (
+      fs.existsSync(devicePath) &&
+      isLinuxDeviceClassAllowed(deviceClass, deviceConfig)
+    ) {
+      passthroughEntries.set(devicePath, deviceClass)
+    }
+  }
+
+  try {
+    for (const entry of fs.readdirSync('/dev')) {
+      for (const { deviceClass, prefix } of LINUX_DEVICE_PREFIX_MAPPINGS) {
+        if (
+          entry.startsWith(prefix) &&
+          isLinuxDeviceClassAllowed(deviceClass, deviceConfig)
+        ) {
+          const devicePath = path.join('/dev', entry)
+          if (fs.existsSync(devicePath)) {
+            passthroughEntries.set(devicePath, deviceClass)
+          }
+        }
+      }
+    }
+  } catch (error) {
+    logForDebugging(
+      `[Sandbox Linux] Failed to enumerate host /dev entries for passthrough: ${error}`,
+    )
+  }
+
+  return [...passthroughEntries.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([devicePath, deviceClass]) => ({ deviceClass, path: devicePath }))
+}
+
+function appendLinuxHostDevicePassthroughArgs(
+  bwrapArgs: string[],
+  deviceConfig: DeviceAccessConfig | undefined,
+): void {
+  const passthroughEntries = getLinuxHostDevicePassthroughEntries(deviceConfig)
+
+  for (const { path: devicePath } of passthroughEntries) {
+    // Ordering matters: these binds must come AFTER `--dev /dev`, otherwise the
+    // synthetic devtmpfs mount shadows them and host device nodes vanish.
+    bwrapArgs.push('--dev-bind-try', devicePath, devicePath)
+  }
+
+  if (passthroughEntries.length > 0) {
+    const summary = passthroughEntries
+      .map(
+        ({ deviceClass, path: devicePath }) => `${deviceClass}:${devicePath}`,
+      )
+      .join(', ')
+    logForDebugging(`[Sandbox Linux] Re-exposed host device paths: ${summary}`)
+  }
+}
 
 /**
  * Check if any existing component in the path is a file (not a directory).
@@ -1004,6 +1116,7 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
+    deviceConfig,
     abortSignal,
   } = params
 
@@ -1100,8 +1213,11 @@ export async function wrapCommandWithSandboxLinux(
   )
   bwrapArgs.push(...fsArgs)
 
-  // Always bind /dev
+  // Always create a synthetic /dev for the sandbox. Host accelerator / GPU
+  // and other permitted host device nodes are rebound afterwards so filesystem
+  // restrictions remain the main boundary while device exposure stays policy-driven.
   bwrapArgs.push('--dev', '/dev')
+  appendLinuxHostDevicePassthroughArgs(bwrapArgs, deviceConfig)
 
   // ========== PID NAMESPACE ISOLATION ==========
   bwrapArgs.push('--unshare-pid')

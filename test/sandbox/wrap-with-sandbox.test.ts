@@ -965,6 +965,107 @@ describe('linux seccomp-free wrapper behavior', () => {
   })
 })
 
+describe('linux host device passthrough', () => {
+  it('re-exposes allowed host device classes after the synthetic /dev mount', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    const expectedPaths = [
+      '/dev/dri',
+      '/dev/kfd',
+      '/dev/dxg',
+      '/dev/nvidia-caps',
+      '/dev/kvm',
+      '/dev/fuse',
+      '/dev/net/tun',
+    ].filter(devicePath => fs.existsSync(devicePath))
+
+    const expectedPrefixedPaths = fs
+      .readdirSync('/dev')
+      .filter(
+        entry =>
+          entry.startsWith('nvidia') ||
+          entry.startsWith('ttyUSB') ||
+          entry.startsWith('ttyACM') ||
+          entry.startsWith('video') ||
+          entry.startsWith('media') ||
+          entry.startsWith('tpm') ||
+          entry.startsWith('tpmrm') ||
+          entry.startsWith('sd') ||
+          entry.startsWith('nvme') ||
+          entry.startsWith('dm-') ||
+          entry.startsWith('loop'),
+      )
+      .map(entry => `/dev/${entry}`)
+      .filter(devicePath => fs.existsSync(devicePath))
+
+    const passthroughPaths = [...expectedPaths, ...expectedPrefixedPaths]
+
+    if (passthroughPaths.length === 0) {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'nvidia-smi',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: ['/secret'] },
+      writeConfig: undefined,
+      deviceConfig: {
+        allowAll: true,
+      },
+    })
+
+    const syntheticDevIndex = result.indexOf('--dev /dev')
+    expect(syntheticDevIndex).toBeGreaterThan(-1)
+
+    for (const devicePath of passthroughPaths) {
+      const bindSnippet = `--dev-bind-try ${devicePath} ${devicePath}`
+      const bindIndex = result.indexOf(bindSnippet)
+      expect(bindIndex).toBeGreaterThan(syntheticDevIndex)
+    }
+  })
+
+  it('respects deny-listed device classes', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const fs = await import('fs')
+    const gpuPaths = [
+      '/dev/dri',
+      '/dev/kfd',
+      '/dev/dxg',
+      '/dev/nvidia-caps',
+    ].filter(devicePath => fs.existsSync(devicePath))
+    const gpuPrefixedPaths = fs
+      .readdirSync('/dev')
+      .filter(entry => entry.startsWith('nvidia'))
+      .map(entry => `/dev/${entry}`)
+      .filter(devicePath => fs.existsSync(devicePath))
+
+    if (gpuPaths.length === 0 && gpuPrefixedPaths.length === 0) {
+      return
+    }
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'nvidia-smi',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: ['/secret'] },
+      writeConfig: undefined,
+      deviceConfig: {
+        allowAll: true,
+        deny: ['gpu'],
+      },
+    })
+
+    for (const devicePath of [...gpuPaths, ...gpuPrefixedPaths]) {
+      expect(result).not.toContain(`--dev-bind-try ${devicePath} ${devicePath}`)
+    }
+  })
+})
+
 describe('macOS allowWriteWithinDeny warning', () => {
   it('warns once when write carve-outs are supplied to the macOS wrapper', async () => {
     const warnings: string[] = []

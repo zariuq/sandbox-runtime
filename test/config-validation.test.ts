@@ -105,6 +105,10 @@ describe('Config Validation', () => {
         denyWrite: ['/etc'],
         allowWriteWithinDeny: ['/etc/ssl'],
       },
+      devices: {
+        allowAll: true,
+        deny: ['rawBlock', 'video', 'usb'],
+      },
       ignoreViolations: {
         '*': ['/usr/bin'],
         'git push': ['/usr/bin/nc'],
@@ -224,5 +228,47 @@ describe('Config Validation', () => {
     if (result.success) {
       expect(result.data.ripgrep).toBeUndefined()
     }
+  })
+
+  test('should validate device policy config', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      devices: {
+        allowAll: true,
+        deny: ['rawBlock', 'video', 'usb'],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
+  test('should reject invalid device classes', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      devices: {
+        allowAll: true,
+        deny: ['camera'],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
   })
 })
